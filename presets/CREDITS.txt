@@ -1,0 +1,12 @@
+MiniDAW preset samples
+
+All sounds in this folder come from VCSL - Versilian Community Sample Library
+https://github.com/sgossner/VCSL  (license: CC0 1.0 - public domain, free for any use)
+
+They were converted to mono 48 kHz 16-bit WAV, trimmed and normalized.
+
+Melodic\Bell.wav    Tubular Bells 1 / chimes_C4_p_rr1
+Melodic\Organ.wav   Pipe Organ / Loud / Rode_Man3Open_C3
+Melodic\Piano.wav   Grand Piano, Kawai / Sustains / GPiano_sus_C3_v3_rr1_Player
+Drums\*.wav         Bass Drum 1, Snare Drum Modern 1, Tom 1 / Tom 2 (stick), Hi-Hat Cymbal,
+                    Suspended Cymbal 1 / 2 (stick hits, bell)
