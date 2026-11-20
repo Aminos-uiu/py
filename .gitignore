@@ -11,3 +11,7 @@ output/
 # Local tool settings / shortcuts
 .claude/
 *.lnk
+
+# RVC / ONNX license texts (local only, like the parts they cover)
+license/RVC-WebUI*.txt
+license/onnxruntime.txt

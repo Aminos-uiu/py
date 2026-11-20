@@ -1,0 +1,13 @@
+MiniDAW - third-party components
+=================================
+
+MiniDAW itself (daw_gui.cpp, synth.h, sampler.h, pianoroll.h, instrument.h)
+is original work. It includes or ships with the following third-party components.
+The full license text of each one is in this folder.
+
+Component                         License                           File
+--------------------------------  --------------------------------  ---------------------------------
+miniaudio (audio I/O)             Public domain (Unlicense) / MIT-0 miniaudio.txt
+VCSL sample library (all WAVs)    CC0 1.0 (public domain)           VCSL-CC0.txt
+winpthreads (mingw-w64, static)   MIT / BSD                         winpthreads.txt
+mingw-w64 runtime (static)        Public domain / ZPL / BSD-like    mingw-w64-runtime.txt
