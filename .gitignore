@@ -8,5 +8,6 @@ tools/ort_bench.cpp
 # Build output (run_daw_gui.bat rebuilds it)
 output/
 
-# Local tool settings
+# Local tool settings / shortcuts
 .claude/
+*.lnk

@@ -421,13 +421,46 @@ void processBlock(float* out, const float* in, ma_uint32 n) {   // in is NULL wh
 
 std::atomic<i64> gCbFrames{0};   // frames the device asked for (health check of exclusive mode)
 
+// Input from a separate capture device. A duplex stream over two different devices (e.g. the laptop's mic and
+// an audio interface's output) runs at the wrong speed, because the two clocks differ. Then the input is opened
+// as its own device and its audio reaches the output callback through this ring.
+Ring gInRing;
+std::atomic<bool> gSplitIn{false};
+const size_t SPLIT_PREFILL = 960;   // frames kept in the ring (20 ms), so the two clocks can drift without gaps
+
+void capture_callback(ma_device*, void*, const void* pIn, ma_uint32 n) {
+    if (pIn) gInRing.push((const float*)pIn, (size_t)n * IN_CH);   // dropped if the ring is full
+}
+
+void splitInput(float* dst, ma_uint32 n) {   // n frames of input from the ring (silence until it is filled)
+    static bool primed = false;
+    static float scratch[IN_CH * CB_BLOCK];
+    size_t avail = (gInRing.w.load(std::memory_order_acquire) - gInRing.r.load(std::memory_order_relaxed)) / IN_CH;
+    while (avail > 3 * SPLIT_PREFILL + n) {   // too far behind (capture runs faster): drop the surplus
+        size_t drop = std::min<size_t>(CB_BLOCK, avail - SPLIT_PREFILL);
+        gInRing.pop(scratch, drop * IN_CH);
+        avail -= drop;
+    }
+    if (!primed && avail >= SPLIT_PREFILL) primed = true;
+    size_t got = 0;
+    if (primed) {
+        got = gInRing.pop(dst, (size_t)n * IN_CH) / IN_CH;
+        if (got < n) primed = false;   // ran dry: fill up again before continuing
+    }
+    if (got < n) std::memset(dst + got * IN_CH, 0, sizeof(float) * IN_CH * (n - got));
+}
+
 void data_callback(ma_device*, void* pOut, const void* pIn, ma_uint32 n) {
     gCbFrames.fetch_add(n);
     float* out = (float*)pOut;
     const float* in = (const float*)pIn;
+    static float split[IN_CH * CB_BLOCK];
+    bool sp = gSplitIn.load();
     for (ma_uint32 done = 0; done < n;) {
         ma_uint32 c = std::min(CB_BLOCK, n - done);
-        processBlock(out + 2 * done, in ? in + 2 * done : NULL, c);
+        const float* blk = in ? in + IN_CH * done : NULL;
+        if (sp) { splitInput(split, c); blk = split; }
+        processBlock(out + 2 * done, blk, c);
         done += c;
     }
 }
@@ -619,8 +652,8 @@ void endRecordingNow() {   // the device is gone: keep what was recorded
 // ============================================================================
 ma_context gContext;
 std::vector<ma_device_info> gPlayDevs, gCapDevs;
-ma_device gDevice;
-bool gDeviceOpen = false, gHasInput = false;
+ma_device gDevice, gCapDevice;   // gCapDevice: the input, when it cannot share a duplex stream with the output
+bool gDeviceOpen = false, gHasInput = false, gCapOpen = false;
 std::wstring gAudioStatus = L"Audio: not running";
 
 std::wstring utf8ToWide(const char* s) {
@@ -642,8 +675,14 @@ void enumerateAudio() {
     }
 }
 
+void closeCapture() {
+    if (gCapOpen) { ma_device_uninit(&gCapDevice); gCapOpen = false; }
+    gSplitIn = false;
+}
+
 void closeAudio() {
     if (gDeviceOpen) { ma_device_uninit(&gDevice); gDeviceOpen = false; }
+    closeCapture();
     gHasInput = false;
     gPlaying = false;
     if (gRecording.load()) gRecEnd = gPlayPos.load();
@@ -669,46 +708,77 @@ bool audioRunsSmoothly() {   // exclusive mode can open but then starve (driver 
     return gCbFrames.load() - f0 >= (i64)(SR * 0.3 * 0.85);
 }
 
+// Opens the output (duplex: with the input in the same stream). Checked to run at the right speed: exclusive
+// mode can starve, and a duplex stream over two different devices runs too slowly.
+bool openOutput(bool excl, bool duplex, int inSel, int outSel) {
+    ma_device_config c = ma_device_config_init(duplex ? ma_device_type_duplex : ma_device_type_playback);
+    c.sampleRate          = SR;
+    c.playback.format     = ma_format_f32;
+    c.playback.channels   = 2;
+    c.playback.pDeviceID  = (outSel >= 0 && outSel < (int)gPlayDevs.size()) ? &gPlayDevs[outSel].id : NULL;
+    c.capture.format      = ma_format_f32;
+    c.capture.channels    = 2;
+    c.capture.pDeviceID   = (inSel >= 0 && inSel < (int)gCapDevs.size()) ? &gCapDevs[inSel].id : NULL;
+    c.periodSizeInFrames  = 256;
+    c.performanceProfile  = ma_performance_profile_low_latency;
+    c.dataCallback        = data_callback;
+    if (excl) {   // the input stays shared (exclusive input + output starves on many devices)
+        c.playback.shareMode = ma_share_mode_exclusive;
+        c.periodSizeInFrames = 128;
+        c.periods = 2;
+    }
+    if (ma_device_init(&gContext, &c, &gDevice) != MA_SUCCESS) return false;
+    if (ma_device_start(&gDevice) != MA_SUCCESS) { ma_device_uninit(&gDevice); return false; }
+    if (!audioRunsSmoothly()) { ma_device_uninit(&gDevice); return false; }
+    gDeviceOpen = true;
+    gHasInput = duplex;
+    gExclusive = excl;
+    return true;
+}
+
+// Opens the input as a device of its own (its audio goes through gInRing)
+bool openCapture(int inSel) {
+    ma_device_config c = ma_device_config_init(ma_device_type_capture);
+    c.sampleRate         = SR;
+    c.capture.format     = ma_format_f32;
+    c.capture.channels   = 2;
+    c.capture.pDeviceID  = (inSel >= 0 && inSel < (int)gCapDevs.size()) ? &gCapDevs[inSel].id : NULL;
+    c.periodSizeInFrames = 256;
+    c.performanceProfile = ma_performance_profile_low_latency;
+    c.dataCallback       = capture_callback;
+    gInRing.init((size_t)SR * IN_CH);   // 1 s
+    if (ma_device_init(&gContext, &c, &gCapDevice) != MA_SUCCESS) return false;
+    if (ma_device_start(&gCapDevice) != MA_SUCCESS) { ma_device_uninit(&gCapDevice); return false; }
+    gCapOpen = true;
+    return true;
+}
+
 bool openAudio(int inSel, int outSel) {
     closeAudio();
     gExclusive = false;
     bool wantIn = inSel != -2;
-    for (int mode = gLowLat ? 0 : 1; mode < 2 && !gDeviceOpen; ++mode) {
+    // With an input: one duplex stream if it runs right (same device), else output and input opened apart.
+    // Low latency (exclusive output) first, then the normal shared mode. Without the input only as a last resort.
+    for (int mode = gLowLat ? 0 : 1; mode < 2 && wantIn && !gDeviceOpen; ++mode) {
         bool excl = mode == 0;
-        for (int attempt = wantIn ? 0 : 1; attempt < 2 && !gDeviceOpen; ++attempt) {
-            bool duplex = attempt == 0;
-            ma_device_config c = ma_device_config_init(duplex ? ma_device_type_duplex : ma_device_type_playback);
-            c.sampleRate          = SR;
-            c.playback.format     = ma_format_f32;
-            c.playback.channels   = 2;
-            c.playback.pDeviceID  = (outSel >= 0 && outSel < (int)gPlayDevs.size()) ? &gPlayDevs[outSel].id : NULL;
-            c.capture.format      = ma_format_f32;
-            c.capture.channels    = 2;
-            c.capture.pDeviceID   = (inSel >= 0 && inSel < (int)gCapDevs.size()) ? &gCapDevs[inSel].id : NULL;
-            c.periodSizeInFrames  = 256;
-            c.performanceProfile  = ma_performance_profile_low_latency;
-            c.dataCallback        = data_callback;
-            if (excl) {   // the input stays shared (exclusive input + output starves on many devices)
-                c.playback.shareMode = ma_share_mode_exclusive;
-                c.periodSizeInFrames = 128;
-                c.periods = 2;
-            }
-            if (ma_device_init(&gContext, &c, &gDevice) != MA_SUCCESS) continue;
-            if (ma_device_start(&gDevice) != MA_SUCCESS) { ma_device_uninit(&gDevice); continue; }
-            if (excl && !audioRunsSmoothly()) { ma_device_uninit(&gDevice); continue; }
-            gDeviceOpen = true;
-            gHasInput = duplex;
-            gExclusive = excl;
-        }
+        if (openOutput(excl, true, inSel, outSel)) break;
+        if (!openCapture(inSel)) continue;
+        gSplitIn = true;
+        if (openOutput(excl, false, inSel, outSel)) { gHasInput = true; break; }
+        closeCapture();
     }
+    for (int mode = gLowLat ? 0 : 1; mode < 2 && !gDeviceOpen; ++mode) openOutput(mode == 0, false, inSel, outSel);
     if (!gDeviceOpen) { gAudioStatus = L"Audio: failed to open the device"; return false; }
 
     double outMs = gDevice.playback.internalPeriodSizeInFrames * gDevice.playback.internalPeriods * 1000.0
                    / std::max<ma_uint32>(1, gDevice.playback.internalSampleRate);
     double inMs = 0.0;
-    if (gHasInput)
-        inMs = gDevice.capture.internalPeriodSizeInFrames * gDevice.capture.internalPeriods * 1000.0
-               / std::max<ma_uint32>(1, gDevice.capture.internalSampleRate);
+    if (gHasInput) {
+        ma_device& cd = gCapOpen ? gCapDevice : gDevice;
+        inMs = cd.capture.internalPeriodSizeInFrames * cd.capture.internalPeriods * 1000.0
+               / std::max<ma_uint32>(1, cd.capture.internalSampleRate);
+        if (gCapOpen) inMs += SPLIT_PREFILL * 1000.0 / SR;   // what the ring holds
+    }
     gLatCompMs = (float)std::round((outMs + inMs) * 10.0) / 10.0f;
     gOutLatMs = (float)outMs;
 
@@ -1746,8 +1816,29 @@ void openFromCombos() {
     openAudio(in <= 0 ? -2 : in - 2, out - 1);
 }
 
+std::wstring ansiRoundTrip(const std::wstring& s) {   // what an ANSI ini file makes of a name (® -> R ...)
+    int n = WideCharToMultiByte(CP_ACP, 0, s.c_str(), -1, NULL, 0, NULL, NULL);
+    if (n <= 1) return L"";
+    std::string a(n, '\0');
+    WideCharToMultiByte(CP_ACP, 0, s.c_str(), -1, &a[0], n, NULL, NULL);
+    int m = MultiByteToWideChar(CP_ACP, 0, a.c_str(), -1, NULL, 0);
+    if (m <= 1) return L"";
+    std::wstring w(m - 1, L'\0');
+    MultiByteToWideChar(CP_ACP, 0, a.c_str(), -1, &w[0], m);
+    return w;
+}
+
 void selectByText(HWND combo, const std::wstring& text, int fallback) {
     int i = text.empty() ? -1 : (int)SendMessageW(combo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)text.c_str());
+    if (i < 0 && !text.empty()) {   // saved by an older version in an ANSI file: compare the same way
+        int n = (int)SendMessageW(combo, CB_GETCOUNT, 0, 0);
+        for (int k = 0; k < n && i < 0; ++k) {
+            int len = (int)SendMessageW(combo, CB_GETLBTEXTLEN, k, 0);
+            std::wstring s(len, L'\0');
+            SendMessageW(combo, CB_GETLBTEXT, k, (LPARAM)&s[0]);
+            if (ansiRoundTrip(s) == text) i = k;
+        }
+    }
     SendMessageW(combo, CB_SETCURSEL, i >= 0 ? i : fallback, 0);
 }
 
@@ -1762,6 +1853,13 @@ std::wstring settingsPath() {
 void saveAudioSettings() {
     std::wstring f = settingsPath();
     if (f.empty()) return;
+    // A UTF-16 file keeps the device names exactly (in an ANSI file characters such as ® are lost and the
+    // device is not found again). All the keys are written below, so an old ANSI file is simply replaced.
+    unsigned char bom[2] = {0, 0};
+    size_t got = 0;
+    if (FILE* fp = _wfopen(f.c_str(), L"rb")) { got = fread(bom, 1, 2, fp); fclose(fp); }
+    if (got < 2 || bom[0] != 0xFF || bom[1] != 0xFE)
+        if (FILE* fp = _wfopen(f.c_str(), L"wb")) { fputc(0xFF, fp); fputc(0xFE, fp); fclose(fp); }
     WritePrivateProfileStringW(L"audio", L"in", comboText(gInCombo).c_str(), f.c_str());
     WritePrivateProfileStringW(L"audio", L"out", comboText(gOutCombo).c_str(), f.c_str());
     WritePrivateProfileStringW(L"audio", L"lowLatency", gLowLat ? L"1" : L"0", f.c_str());
